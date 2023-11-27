@@ -3,12 +3,11 @@ from typing import Any
 import json
 import hashlib
 import datetime
+import logging
 import random
 from scoring import *
 from optparse import OptionParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
-
 
 SALT = "Otus"
 ADMIN_LOGIN = "admin"
@@ -67,23 +66,49 @@ def get_interests_test(store, cid):
 
 class TemplateField(ABC):
     def __init__(self, *args, **kwargs):
-        self.value = None
         self.field_name = None
-        self.incorrect_flag = False
         self.required = kwargs.get('required', True)
         self.nullable = kwargs.get('nullable', True)
 
     def __get__(self, obj, cls):
         return self
 
-    def __set__(self, obj, value):
-        if self.field_name in value:
-            type(self).set_value(self, value[self.field_name])
-            if self.value is None and not self.nullable:
-                raise ValueError(f'[{self.field_name}] should not be None')
+    def __set__(self, obj, params):
+        value = None
+        self.is_filled= False
+        self.is_valid = False
+        self.is_declared = False
+
+        if self.field_name in params:
+            self.is_declared = True
+            value = params[self.field_name]
+            if not(value is None or (hasattr(value, '__len__') and len(value) == 0)):
+                self.is_filled = True
+            else:
+                if not self.nullable:
+                    logging.error(f'[{self.field_name}] is null')
+
         else:
             if self.required:
-                raise ValueError(f'[{self.field_name}] field should be define')
+                logging.error(f'[{self.field_name}] not declared')
+        if self.set_value(value):
+            self.is_valid = True
+        else:
+            logging.error(f'[{self.field_name}] not valid value')
+
+    @property
+    def correct(self):
+        return self.is_valid and (self.is_declared or not self.required) and (self.is_filled or self.nullable)
+
+    def get_not_valid_reason(self) -> str:
+        if not self.correct:
+            if not self.is_declared and self.required:
+                return 'not_declare'
+            elif not(self.is_filled or self.nullable):
+                return 'null'
+            else:
+                return 'not_valid'
+        return 'ok'
 
     def __str__(self):
         return self.value if bool(self) else ''
@@ -95,69 +120,78 @@ class TemplateField(ABC):
     def set_value(self, value):
         pass
 
+
     def __and__(self, other):
-        return (self.value is not None) & bool(other)
+        return bool(self) & bool(other)
 
     def __or__(self, other):
-        return (self.value is not None) | bool(other)
+        return bool(self) | bool(other)
 
     def __rand__(self, other):
-        return (self.value is not None) & bool(other)
+        return bool(self) & bool(other)
 
     def __ror__(self, other):
-        return (self.value is not None) | bool(other)
+        return bool(self) | bool(other)
 
     def __eq__(self, other):
         return str(self) == str(other)
 
     def __bool__(self):
-        return self.value is not None
+        return self.correct
 
     def __set_name__(self, owner, name):
         self.field_name = name
-        owner.fields_list.append(name)
+        owner.fields_list.update(name)
 
 
 class CharField(TemplateField):
     """
         contains simple text fields
+        return True if value is valid, False otherwise
     """
+    def __init__(self, *args, **kwargs):
+        self.value = ''
+        super().__init__(*args, **kwargs)
 
-    def set_value(self, value) -> Any:
+    def set_value(self, value) -> bool:
         self.value = value
+        return True
 
 
 class ClientIDsField(TemplateField):
     """
-        contains client id fields (as simple text)
+        contains client id fields (in tuple)
+        return True if value is valid, False otherwise
     """
+    def __init__(self, *args, **kwargs):
+        self.value = list()
+        super().__init__(*args, **kwargs)
 
-    def set_value(self, value) -> Any:
-        self.value = tuple(value)
+    def set_value(self, value) -> bool:
+        if hasattr(value, '__iter__'):
+            self.value = (*value,)
+        else:
+            self.value = (value,)
+        return True
 
     def __iter__(self):
         return self.value.__iter__()
 
-    def __str__(self):
-        return self.value.__str__()
 
 
 class ArgumentsField(TemplateField):
     """
         contains arguments dictionary
+        return True if value is valid, False otherwise
     """
 
+    def __init__(self, *args, **kwargs):
+        self.value = dict()
+        super().__init__(*args, **kwargs)
+
     def set_value(self, value):
-        try:
-            self.value = json.loads(value)
-
-        except ValueError  as e:
-            self.incorrect_flag = True
-
-        except TypeError  as e:
-            self.incorrect_flag = True
-
-
+        self.value = value if value is not None else dict()
+        return True
 
     def __str__(self):
         return self.value.__str__()
@@ -179,29 +213,36 @@ class EmailField(TemplateField):
     """
            contains email fields.
            set method checks for "@" in string
+           return True if value is valid, False otherwise
     """
+    def __init__(self, *args, **kwargs):
+        self.value = None
+        super().__init__(*args, **kwargs)
 
     def set_value(self, value):
-        if '@' not in value:
-            self.incorrect_flag = True
-            raise ValueError(f'[{self.field_name}] incorrect email format')
-        else:
-            self.value = value
+        if value is not None:
+            if isinstance(value, str) and '@' in value:
+                self.value = value
+            else:
+                return False
+        return True
 
 
 class PhoneField(TemplateField):
     """
         contains phone number
     """
+    def __init__(self, *args, **kwargs):
+        self.value = None
+        super().__init__(*args, **kwargs)
 
     def set_value(self, value):
         if not (value.isdigit()
                 and value[0] == '7'
                 and len(value) == 11):
-            self.incorrect_flag = True
-            raise ValueError(f'[{self.field_name}] incorrect phone number format')
+            return True
         else:
-            self.value = value
+            return False
 
 
 class DateField(TemplateField):
@@ -211,11 +252,12 @@ class DateField(TemplateField):
 
     def set_value(self, value):
         try:
-            date = datetime.datetime.strptime(value, '%d.%m.%Y')
+            self.value = datetime.datetime.strptime(value, '%d.%m.%Y')
 
         except ValueError as e:
             self.incorrect_flag = True
-            raise ValueError from e
+            self.syntax_violation = True
+            logging.error('date format error')
 
     def __str__(self):
         return datetime.datetime.strftime(self.value, '%d.%m.%Y')
@@ -225,19 +267,17 @@ class BirthDayField(DateField):
     """
         contain and check person birthday.
     """
-
     def set_value(self, value):
-        try:
-            birthday = datetime.datetime.strptime(value, '%d.%m.%Y')
+        super().set_value(value)
+        if self.value:
             today = datetime.date.today()
-            age = today.year - birthday.year - (today.timetuple().tm_yday < birthday.timetuple().tm_yday)
+            age = today.year - self.value.year - (today.timetuple().tm_yday < self.value.timetuple().tm_yday)
             if 70 >= age > 0:
-                self.value = birthday
+                self.value = self.value
             else:
-                raise ValueError(f'age={age} out of range [0..70]')
-        except ValueError as e:
-            self.incorrect_flag = True
-            raise ValueError from e
+                self.incorrect_flag = True
+                self.syntax_violation = True
+                logging.error('age period [0..70] exceed')
 
     def __str__(self):
         return datetime.datetime.strftime(self.value, '%d.%m.%Y')
@@ -247,59 +287,55 @@ class GenderField(TemplateField):
     """
         contain and check person birthday.
     """
-
     def set_value(self, value):
         if value in GENDERS:
             self.value = value
         else:
-            raise ValueError(f'[{self.field_name}] incorrect gender decoding format')
+            logging.error('gender encoding format error')
 
 
 class TemplateRequest(ABC):
-    def __init__(self, *args, **kwargs):
-        if len(args) > 0 and callable(args[0]):
-            self.current_wrapper = self.wrapper
-            self.call = args[0]
-            self.target_handler = self.target_handler_stub
-        else:
-            self.target_handler = (kwargs.get('target_handler', check_auth))
-            self.current_wrapper = self.decorator
+    context = None
+    store = None
 
-    def decorator(self, function):
-        self.call = function
-        self.current_wrapper = self.wrapper
-        return self
+    def __init__(self, decorated_function):
+        self.call = decorated_function
 
-    def wrapper(self, request, ctx, store):
+    def __call__(self, request, ctx, store):
+        self.context = ctx
+        self.store = store
         response, code = self.call(request, ctx, store)
         if code is None and self.is_processed:
-            for field_name in type(self).fields_list:
+            for field_name in self.fields_list:
                 setattr(self, field_name,
-                    self.arguments if isinstance(self.call, TemplateRequest) else request['body'])
-            status = self.target_handler(self, ctx, store)
-            if isinstance(status, tuple):
-                return status
+                        self.arguments if isinstance(self.call, TemplateRequest) else request['body'])
+            if self.is_correct_arguments:
+                response, code = self.process_function()
             else:
-                return (None, None) if status else (None, FORBIDDEN)
+                response, code = self.get_response_error()
         return response, code
 
-    @staticmethod
-    def target_handler_stub(request, ctx, store):
-        return check_auth(request)
 
     def __contains__(self, method_name):
         return str(method_name) in self.support_methods
 
-    def __call__(self, *args, **kwargs):
-        return self.current_wrapper(*args, **kwargs)
+    @property
+    @abstractmethod
+    def is_correct_arguments(self):
+        pass
 
     @property
     @abstractmethod
     def is_processed(self):
         pass
 
-    def __call__(self, *args, **kwargs):
-        return self.current_wrapper(*args, **kwargs)
+    @abstractmethod
+    def process_function(self):
+        pass
+
+    @abstractmethod
+    def get_response_error(self):
+        pass
 
     def __getattr__(self, name):
         return getattr(self.call, name)
@@ -311,7 +347,7 @@ class MethodRequest(TemplateRequest):
     token = CharField(required=True, nullable=True)
     arguments = ArgumentsField(required=True, nullable=True)
     method = CharField(required=True, nullable=False)
-    fields_list = []
+    fields = dict()
 
     @property
     def is_admin(self):
@@ -321,6 +357,26 @@ class MethodRequest(TemplateRequest):
     def is_processed(self):
         return True
 
+    @property
+    def is_correct_arguments(self):
+        for field_name in self.fields:
+            if field_name['incorrect_flag']:
+                return False
+        return True
+
+    def process_function(self):
+        if check_auth(self):
+            return 'Forbidden', FORBIDDEN
+
+    def get_response_error(self):
+        response = list()
+        for field_name in self.fields:
+            if field_name['incorrect_flag']:
+                response.append(field_name)
+        return response
+
+
+
 
 class OnlineScoreRequest(TemplateRequest):
     fields_list = []
@@ -329,7 +385,7 @@ class OnlineScoreRequest(TemplateRequest):
     email = EmailField(required=False, nullable=True)
     phone = PhoneField(required=False, nullable=True)
     birthday = BirthDayField(required=False, nullable=True)
-    gender = GenderField(required=True, nullable=True)
+    gender = GenderField(required=False, nullable=True)
 
     def __init__(self, *args, **kwargs):
         self.support_methods = {'online_score'}
@@ -370,25 +426,24 @@ class TerminalRequest(TemplateRequest):
             #     'code': code})
             return response, code
 
-
     @property
     def is_processed(self):
         return True
 
 
 def pipe_get_score(request, ctx, store):
-    if not ((request.first_name | request.last_name) & (request.email | request.phone) &
-            (request.gender | request.birthday)):
+    if not ((request.first_name & request.last_name) | (request.email & request.phone) |
+            (request.gender & request.birthday)):
         all_fields = (request.first_name, request.last_name,
                       request.email, request.phone,
-                      request.gender & request.birthday)
+                      request.gender, request.birthday)
 
-        return  [field.field_name for field in all_fields if not field], INVALID_REQUEST
+        return [field.field_name for field in all_fields if not field], 4226
 
     try:
         score = get_score(store, request.phone.value, request.email.value, request.birthday.value,
                           request.gender.value, request.first_name.value, request.last_name.value)
-        return score, OK
+        return {"score": score}, OK
     except:
         return None, INTERNAL_ERROR
 
@@ -409,12 +464,13 @@ def method_handler(request, ctx, store):
     response, code = None, None
     return response, code
 
-arg = dict(body=  {'method': 'online_score',
-       'account': '123001234',
-       'login': 'freebsd',
-       'token': hashlib.sha512(('123001234' + 'freebsd' + SALT).encode()).hexdigest(),
-       'arguments': '{"phone": "79175002040", "email": "stupnikov@otus.ru", "gender": 1, "birthday": "26.10.1960", "first_name": "stanislav", "last_name1": "stulenkov"}'
-       })
+
+arg = dict(body={'method': 'online_score',
+                 'account': '123001234',
+                 'login': 'freebsd',
+                 'token': hashlib.sha512(('123001234' + 'freebsd' + SALT).encode()).hexdigest(),
+                 'arguments': {"phone":"79175002040", "email": "stupnikov@otus.ru", "gender":1, "birthday": "26.10.1960", "first_name": "stanislav", "last_name1": "stulenkov"}
+                 })
 #
 # arg1 = {'method': 'clients_interests',
 #         'account': '123001234',
